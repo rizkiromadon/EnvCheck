@@ -258,20 +258,19 @@ jobs:
           cp dist-raw/${{ env.BINARY }}-${{ env.TAG }}-linux-${{ matrix.arch }}/${{ env.BINARY }} dist/${{ env.BINARY }}-linux-${{ matrix.arch }}
           chmod +x dist/${{ env.BINARY }}-linux-${{ matrix.arch }}
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
       - name: Install nfpm
-        run: |
-          curl -sSfL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_amd64.deb -o /tmp/nfpm.deb || \
-          (curl -sSfLo /tmp/nfpm.tar.gz https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_$(uname -s)_$(uname -m).tar.gz && \
-           tar -xzf /tmp/nfpm.tar.gz -C /tmp && sudo mv /tmp/nfpm /usr/local/bin/nfpm)
-          if [ -f /tmp/nfpm.deb ]; then sudo dpkg -i /tmp/nfpm.deb; fi
-          nfpm --version
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
 
       - name: Build package
         env:
           VERSION: ${{ env.VERSION }}
         run: |
           sed "s#\./dist/envcheck-linux-amd64#./dist/${{ env.BINARY }}-linux-${{ matrix.arch }}#" packaging/nfpm.yaml > /tmp/nfpm.${{ matrix.arch }}.yaml
-          nfpm package \
+          $(go env GOPATH)/bin/nfpm package \
             --config /tmp/nfpm.${{ matrix.arch }}.yaml \
             --packager ${{ matrix.format }} \
             --target dist/ \
