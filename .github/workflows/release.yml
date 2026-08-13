@@ -1,0 +1,524 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.2.3). Must already exist."
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  GO_VERSION: "1.22"
+  BINARY: envcheck
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Run the full test suite before anything is built or published.
+  # ---------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify module
+        run: go mod verify
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -race -cover -coverprofile=coverage.out
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Self-check (dogfooding)
+        run: |
+          go build -o envcheck ./cmd/envcheck
+          ./envcheck testdata/valid.env --no-color --json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Resolve version/tag once, generate the changelog, and pass both to
+  # every downstream job so nothing has to re-derive them.
+  # ---------------------------------------------------------------------
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag and version
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" =~ -(alpha|beta|rc)([.-]?[0-9]+)?$ ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate changelog since previous tag
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 "${{ steps.meta.outputs.tag }}^" 2>/dev/null || echo "")
+          {
+            echo "## What's Changed"
+            echo
+            if [ -n "$PREV_TAG" ]; then
+              git log "$PREV_TAG"..${{ steps.meta.outputs.tag }} --pretty=format:"* %s (%h)" --no-merges
+              echo
+              echo
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREV_TAG...${{ steps.meta.outputs.tag }}"
+            else
+              git log --pretty=format:"* %s (%h)" --no-merges
+            fi
+          } > CHANGELOG_RELEASE.md
+          cat CHANGELOG_RELEASE.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: CHANGELOG_RELEASE.md
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Cross-compile static binaries for every supported OS/arch, package
+  # each as .tar.gz (unix) / .zip (windows), and checksum everything.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: "386"
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: freebsd
+            goarch: amd64
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Determine output name
+        id: name
+        run: |
+          NAME="${{ env.BINARY }}-${{ env.TAG }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "ext=$EXT" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          mkdir -p dist/${{ steps.name.outputs.name }}
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ env.VERSION }}" \
+            -o dist/${{ steps.name.outputs.name }}/${{ env.BINARY }}${{ steps.name.outputs.ext }} \
+            ./cmd/envcheck
+
+      - name: Stage supplementary files
+        run: |
+          cp README.md LICENSE dist/${{ steps.name.outputs.name }}/
+          mkdir -p dist/${{ steps.name.outputs.name }}/testdata
+          cp testdata/*.env testdata/*.example dist/${{ steps.name.outputs.name }}/testdata/ 2>/dev/null || true
+
+      - name: Generate per-binary SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: dist/${{ steps.name.outputs.name }}
+          format: spdx-json
+          output-file: dist/${{ steps.name.outputs.name }}/sbom.spdx.json
+          artifact-name: ""
+
+      - name: Archive (tar.gz)
+        if: matrix.goos != 'windows'
+        working-directory: dist
+        run: tar -czf ${{ steps.name.outputs.name }}.tar.gz ${{ steps.name.outputs.name }}
+
+      - name: Archive (zip)
+        if: matrix.goos == 'windows'
+        working-directory: dist
+        run: zip -r ${{ steps.name.outputs.name }}.zip ${{ steps.name.outputs.name }}
+
+      - name: Checksum
+        working-directory: dist
+        run: |
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            sha256sum ${{ steps.name.outputs.name }}.zip > ${{ steps.name.outputs.name }}.zip.sha256
+          else
+            sha256sum ${{ steps.name.outputs.name }}.tar.gz > ${{ steps.name.outputs.name }}.tar.gz.sha256
+          fi
+
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            dist/${{ steps.name.outputs.name }}/${{ env.BINARY }}${{ steps.name.outputs.ext }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Package .deb / .rpm / .apk with nfpm from the linux/amd64 and
+  # linux/arm64 binaries built above.
+  # ---------------------------------------------------------------------
+  package-linux:
+    name: Package (${{ matrix.format }}, ${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        format: [deb, rpm, apk]
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download raw linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: build-linux-${{ matrix.arch }}
+          path: dist-raw
+
+      - name: Extract binary for nfpm
+        run: |
+          mkdir -p dist
+          tar -xzf dist-raw/${{ env.BINARY }}-${{ env.TAG }}-linux-${{ matrix.arch }}.tar.gz -C dist-raw
+          cp dist-raw/${{ env.BINARY }}-${{ env.TAG }}-linux-${{ matrix.arch }}/${{ env.BINARY }} dist/${{ env.BINARY }}-linux-${{ matrix.arch }}
+          chmod +x dist/${{ env.BINARY }}-linux-${{ matrix.arch }}
+
+      - name: Install nfpm
+        run: |
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_amd64.deb -o /tmp/nfpm.deb || \
+          (curl -sSfLo /tmp/nfpm.tar.gz https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_$(uname -s)_$(uname -m).tar.gz && \
+           tar -xzf /tmp/nfpm.tar.gz -C /tmp && sudo mv /tmp/nfpm /usr/local/bin/nfpm)
+          if [ -f /tmp/nfpm.deb ]; then sudo dpkg -i /tmp/nfpm.deb; fi
+          nfpm --version
+
+      - name: Build package
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          sed "s#\./dist/envcheck-linux-amd64#./dist/${{ env.BINARY }}-linux-${{ matrix.arch }}#" packaging/nfpm.yaml > /tmp/nfpm.${{ matrix.arch }}.yaml
+          nfpm package \
+            --config /tmp/nfpm.${{ matrix.arch }}.yaml \
+            --packager ${{ matrix.format }} \
+            --target dist/ \
+            --arch ${{ matrix.arch == 'amd64' && 'amd64' || 'arm64' }}
+
+      - name: Checksum packages
+        working-directory: dist
+        run: |
+          for f in *.deb *.rpm *.apk; do
+            [ -f "$f" ] && sha256sum "$f" > "$f.sha256"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.format }}-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.apk
+            dist/*.sha256
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------
+  # Generate a project-wide SBOM covering all Go module dependencies.
+  # ---------------------------------------------------------------------
+  sbom:
+    name: Generate project SBOM
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Generate SBOM (SPDX + CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: envcheck-${{ needs.prepare.outputs.tag }}.sbom.spdx.json
+          artifact-name: ""
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: envcheck-${{ needs.prepare.outputs.tag }}.sbom.cdx.json
+          artifact-name: ""
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            envcheck-*.sbom.spdx.json
+            envcheck-*.sbom.cdx.json
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Vulnerability scan against the module graph, informational (does not
+  # block release) but shipped as an artifact for auditability.
+  # ---------------------------------------------------------------------
+  vuln-scan:
+    name: Vulnerability scan (govulncheck)
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck -format json ./... > govulncheck-report.json || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vuln-report
+          path: govulncheck-report.json
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Collect every artifact produced above, build one master checksums
+  # file, sign it, and publish the GitHub Release.
+  # ---------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [prepare, build, package-linux, sbom, vuln-scan]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release directory
+        run: |
+          mkdir -p release
+          find artifacts -type f \( \
+            -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \
+            -o -name "*.deb" -o -name "*.rpm" -o -name "*.apk" \
+            -o -name "*.sbom.spdx.json" -o -name "*.sbom.cdx.json" \
+            -o -name "govulncheck-report.json" -o -name "coverage.out" \
+          \) -exec cp {} release/ \;
+          cp artifacts/changelog/CHANGELOG_RELEASE.md release/ 2>/dev/null || true
+          ls -la release/
+
+      - name: Build master checksums file
+        working-directory: release
+        run: |
+          rm -f SHA256SUMS.txt
+          sha256sum $(find . -maxdepth 1 -type f ! -name "SHA256SUMS.txt" ! -name "*.sha256" | sort) > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign master checksums file (keyless)
+        working-directory: release
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.txt.sig \
+            --output-certificate SHA256SUMS.txt.pem \
+            SHA256SUMS.txt
+
+      - name: Generate SBOM attestation summary
+        working-directory: release
+        run: |
+          {
+            echo "# EnvCheck ${{ needs.prepare.outputs.tag }} — Artifact Manifest"
+            echo
+            echo "| File | SHA-256 |"
+            echo "|---|---|"
+            while read -r sum file; do
+              echo "| \`$file\` | \`$sum\` |"
+            done < SHA256SUMS.txt
+          } > ARTIFACTS.md
+          cat ARTIFACTS.md
+
+      - name: Compose release notes
+        run: |
+          {
+            cat release/CHANGELOG_RELEASE.md 2>/dev/null || echo "## What's Changed"
+            echo
+            echo "## Artifacts"
+            echo
+            echo "This release includes:"
+            echo "- Cross-platform binaries (linux/darwin/windows/freebsd, amd64/arm64/386) as \`.tar.gz\` / \`.zip\`"
+            echo "- Linux packages: \`.deb\`, \`.rpm\`, \`.apk\` for amd64 and arm64"
+            echo "- Arch Linux \`PKGBUILD\` (see \`packaging/arch/\`)"
+            echo "- SPDX and CycloneDX SBOMs for the full project and per-binary"
+            echo "- \`govulncheck\` vulnerability report"
+            echo "- Test coverage report"
+            echo "- \`SHA256SUMS.txt\` covering every artifact, signed with cosign (keyless/Sigstore)"
+            echo "- Build provenance attestations (SLSA) for each binary, verifiable via \`gh attestation verify\`"
+            echo
+            echo "### Verifying a download"
+            echo '```bash'
+            echo "# Verify checksum"
+            echo "sha256sum -c SHA256SUMS.txt --ignore-missing"
+            echo
+            echo "# Verify the checksums file signature (requires cosign)"
+            echo "cosign verify-blob \\"
+            echo "  --certificate SHA256SUMS.txt.pem \\"
+            echo "  --signature SHA256SUMS.txt.sig \\"
+            echo "  --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  SHA256SUMS.txt"
+            echo
+            echo "# Verify build provenance (requires GitHub CLI)"
+            echo "gh attestation verify <binary> -R ${{ github.repository }}"
+            echo '```'
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: EnvCheck ${{ needs.prepare.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: false
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.sha256
+            release/*.deb
+            release/*.rpm
+            release/*.apk
+            release/*.sbom.spdx.json
+            release/*.sbom.cdx.json
+            release/govulncheck-report.json
+            release/coverage.out
+            release/SHA256SUMS.txt
+            release/SHA256SUMS.txt.sig
+            release/SHA256SUMS.txt.pem
+            release/ARTIFACTS.md
+
+  # ---------------------------------------------------------------------
+  # Bump the Arch Linux PKGBUILD pkgver/sha256sums for this tag and open
+  # a PR, since AUR-style packages are usually maintained via source URL.
+  # ---------------------------------------------------------------------
+  update-pkgbuild:
+    name: Update PKGBUILD
+    runs-on: ubuntu-latest
+    needs: [prepare, publish]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Compute source tarball checksum
+        id: sum
+        run: |
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/${{ needs.prepare.outputs.tag }}.tar.gz"
+          curl -sSfL "$URL" -o source.tar.gz
+          echo "sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Update PKGBUILD
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ needs.prepare.outputs.version }}/" packaging/arch/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/arch/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sum.outputs.sha256 }}')/" packaging/arch/PKGBUILD
+          cat packaging/arch/PKGBUILD
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(packaging): bump PKGBUILD to ${{ needs.prepare.outputs.tag }}"
+          title: "chore(packaging): bump PKGBUILD to ${{ needs.prepare.outputs.tag }}"
+          body: |
+            Automated update of `packaging/arch/PKGBUILD` for release
+            ${{ needs.prepare.outputs.tag }}, updating `pkgver` and the
+            source tarball `sha256sums`.
+          branch: chore/pkgbuild-${{ needs.prepare.outputs.tag }}
+          add-paths: packaging/arch/PKGBUILD
