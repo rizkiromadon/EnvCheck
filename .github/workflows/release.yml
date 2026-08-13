@@ -281,8 +281,9 @@ jobs:
       - name: Checksum packages
         working-directory: dist
         run: |
+          shopt -s nullglob
           for f in *.deb *.rpm *.apk; do
-            [ -f "$f" ] && sha256sum "$f" > "$f.sha256"
+            sha256sum "$f" > "$f.sha256"
           done
 
       - uses: actions/upload-artifact@v4
