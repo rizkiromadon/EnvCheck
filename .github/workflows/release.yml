@@ -269,12 +269,14 @@ jobs:
         env:
           VERSION: ${{ env.VERSION }}
         run: |
-          sed "s#\./dist/envcheck-linux-amd64#./dist/${{ env.BINARY }}-linux-${{ matrix.arch }}#" packaging/nfpm.yaml > /tmp/nfpm.${{ matrix.arch }}.yaml
+          sed \
+            -e "s#\./dist/envcheck-linux-amd64#./dist/${{ env.BINARY }}-linux-${{ matrix.arch }}#" \
+            -e "s/^arch:.*/arch: ${{ matrix.arch }}/" \
+            packaging/nfpm.yaml > /tmp/nfpm.${{ matrix.arch }}.yaml
           $(go env GOPATH)/bin/nfpm package \
             --config /tmp/nfpm.${{ matrix.arch }}.yaml \
             --packager ${{ matrix.format }} \
-            --target dist/ \
-            --arch ${{ matrix.arch == 'amd64' && 'amd64' || 'arm64' }}
+            --target dist/
 
       - name: Checksum packages
         working-directory: dist
