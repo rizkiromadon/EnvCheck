@@ -1,6 +1,6 @@
 # Maintainer: rizkiromadon <https://github.com/rizkiromadon>
 pkgname=envcheck
-pkgver=1.0.0
+pkgver=1.0.4
 pkgrel=1
 pkgdesc="Fast CLI to validate, analyze, and security-check .env files"
 arch=('x86_64' 'aarch64')
@@ -8,7 +8,7 @@ url="https://github.com/rizkiromadon/envcheck"
 license=('MIT')
 makedepends=('go>=1.22')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/rizkiromadon/envcheck/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP') # replace with the real checksum when cutting a release
+sha256sums=('8d4fd07a0b8622d38c45bb7ec9174b10697097cefdde15aa42c3ac4edb0010ff')
 
 build() {
   cd "$pkgname-$pkgver"
