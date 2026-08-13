@@ -1,0 +1,8 @@
+/envcheck
+/dist/
+*.deb
+*.rpm
+*.pkg.tar.zst
+*.test
+*.out
+.DS_Store

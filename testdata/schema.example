@@ -1,0 +1,4 @@
+PORT=number|required
+DATABASE_URL=url|required|secret
+NODE_ENV=enum:development,production,test|required
+DEBUG=boolean|optional

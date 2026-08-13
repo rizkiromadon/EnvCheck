@@ -1,0 +1,40 @@
+# nfpm configuration: builds .deb and .rpm packages from the cross-compiled
+# binaries in dist/, without requiring a Debian or RPM build environment.
+# Install nfpm: https://nfpm.goreleaser.com/install/
+#
+# Usage:
+#   make cross
+#   nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+#   nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+
+name: envcheck
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: "rizkiromadon <https://github.com/rizkiromadon>"
+description: |
+  Fast, lightweight CLI to validate, analyze, and security-check .env files.
+  Detects syntax errors, duplicate keys, empty values, and possible secrets;
+  supports schema validation and .env.example comparison. Designed for both
+  local development and CI/CD pipelines.
+vendor: "EnvCheck"
+homepage: "https://github.com/rizkiromadon/envcheck"
+license: "MIT"
+
+contents:
+  - src: ./dist/envcheck-linux-amd64
+    dst: /usr/bin/envcheck
+    file_info:
+      mode: 0755
+  - src: ./README.md
+    dst: /usr/share/doc/envcheck/README.md
+  - src: ./LICENSE
+    dst: /usr/share/doc/envcheck/LICENSE
+
+overrides:
+  rpm:
+    depends: []
+  deb:
+    depends: []

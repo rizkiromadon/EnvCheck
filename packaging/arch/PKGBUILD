@@ -1,0 +1,29 @@
+# Maintainer: rizkiromadon <https://github.com/rizkiromadon>
+pkgname=envcheck
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Fast CLI to validate, analyze, and security-check .env files"
+arch=('x86_64' 'aarch64')
+url="https://github.com/rizkiromadon/envcheck"
+license=('MIT')
+makedepends=('go>=1.22')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/rizkiromadon/envcheck/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP') # replace with the real checksum when cutting a release
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CGO_ENABLED=0
+  go build -ldflags "-s -w -X main.version=$pkgver" -o "$pkgname" ./cmd/envcheck
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  go test ./...
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
